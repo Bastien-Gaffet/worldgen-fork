@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""Fork/rescope a worldgen datapack onto a private namespace, for a single new world.
+
+Origine : generalise le script fork_v5.py ecrit pour le fork Terralith->PlanetY.
+Doc complete : docs/worldgen-fork.md dans le repo local (serveur_pcsi).
+"""
+import argparse, json, os, pwd, re, shutil, sys, tempfile, zipfile
+
+DEFAULT_DROP_REG = {
+    "world_preset",
+    "flat_level_generator_preset",
+    "multi_noise_biome_source_parameter_list",
+}
+
+ID_RE = re.compile(r"^minecraft:([A-Za-z0-9_./-]+)$")
+
+
+def die(msg):
+    print("ERREUR:", msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def find_data_root(path):
+    """Un datapack a un dossier `data/` a la racine, ou dans un unique sous-dossier
+    (cas frequent des zips telecharges avec un dossier wrapper)."""
+    if os.path.isdir(os.path.join(path, "data")):
+        return path
+    for name in os.listdir(path):
+        sub = os.path.join(path, name)
+        if os.path.isdir(sub) and os.path.isdir(os.path.join(sub, "data")):
+            return sub
+    die(f"pas de dossier data/ trouve dans {path} (ni a la racine, ni dans un sous-dossier direct)")
+
+
+def extract_source(src):
+    if os.path.isdir(src):
+        return find_data_root(src), None
+    if not os.path.isfile(src):
+        die(f"source introuvable: {src}")
+    tmp = tempfile.mkdtemp(prefix="worldgen-fork-src-")
+    try:
+        with zipfile.ZipFile(src) as z:
+            z.extractall(tmp)
+    except zipfile.BadZipFile:
+        die(f"{src} n'est ni un dossier ni un .zip/.jar valide")
+    return find_data_root(tmp), tmp
+
+
+def dimension_basename(dim_type):
+    # "minecraft:overworld" -> "overworld.json", "minecraft:the_nether" -> "the_nether.json"
+    return dim_type.split(":", 1)[-1] + ".json"
+
+
+def build_forked_map(src_wg, drop_reg):
+    forked = {}
+    for root, _dirs, files in os.walk(src_wg):
+        for f in files:
+            if not f.endswith(".json"):
+                continue
+            rel = os.path.relpath(os.path.join(root, f), src_wg).split(os.sep)
+            reg = rel[0]
+            if reg in drop_reg:
+                continue
+            forked.setdefault(reg, set()).add("/".join(rel[1:])[:-5])
+    return forked
+
+
+def target_reg(file_reg, key):
+    """Sait, pour un fichier d'un registre donne et une cle JSON donnee, dans quel
+    registre vanilla resoudre un id `minecraft:xxx` qu'on y trouve. Ce mapping est
+    une propriete du schema JSON du worldgen vanilla, pas du datapack source : il
+    n'a normalement pas besoin d'etre retouche d'un datapack a l'autre. Si un
+    nouveau cas de collision inter-registres apparait (voir docs/worldgen-fork.md
+    section Depannage), ajouter la regle ici."""
+    if key == "settings":
+        return "noise_settings"
+    if key == "biome":
+        return "biome"
+    if key == "noise":
+        return "noise"
+    if key == "default_clock":
+        return "world_clock"
+    if file_reg == "biome":
+        if key == "features":
+            return "placed_feature"
+        if key == "carvers":
+            return "configured_carver"
+    if file_reg == "placed_feature" and key == "feature":
+        return "configured_feature"
+    if file_reg == "configured_feature" and key in ("feature", "default"):
+        return "configured_feature"
+    return None
+
+
+def make_rewrite_id(ns, forked):
+    def rewrite_id(x, treg):
+        if treg is not None:
+            return ns + ":" + x if x in forked.get(treg, ()) else "minecraft:" + x
+        regs = [r for r, s in forked.items() if x in s]
+        return ns + ":" + x if len(regs) == 1 else "minecraft:" + x
+    return rewrite_id
+
+
+def make_walk(ns, forked, all_forked):
+    rewrite_id = make_rewrite_id(ns, forked)
+
+    def walk(o, file_reg, key=None):
+        if isinstance(o, dict):
+            return {k: (v if (k == "type" and isinstance(v, str)) else walk(v, file_reg, k)) for k, v in o.items()}
+        if isinstance(o, list):
+            return [walk(x, file_reg, key) for x in o]
+        if isinstance(o, str):
+            m = ID_RE.match(o)
+            if m and m.group(1) in all_forked:
+                return rewrite_id(m.group(1), target_reg(file_reg, key))
+            return o
+        return o
+    return walk
+
+
+def emit(src_dir, dst_dir, is_worldgen, walk, drop_reg, errors):
+    n = 0
+    for root, _dirs, files in os.walk(src_dir):
+        for f in files:
+            full = os.path.join(root, f)
+            rel = os.path.relpath(full, src_dir)
+            parts = rel.split(os.sep)
+            if parts[0] in drop_reg or "world_preset" in parts or "multi_noise_biome_source_parameter_list" in parts:
+                continue
+            file_reg = parts[0] if is_worldgen else (parts[1] if (len(parts) > 1 and parts[0] == "worldgen") else None)
+            outp = os.path.join(dst_dir, rel)
+            os.makedirs(os.path.dirname(outp), exist_ok=True)
+            if f.endswith(".json"):
+                try:
+                    obj = json.load(open(full, encoding="utf-8"))
+                    json.dump(walk(obj, file_reg), open(outp, "w", encoding="utf-8"), separators=(",", ":"))
+                    n += 1
+                except Exception as e:
+                    errors.append(f"{rel}: {e}")
+                    shutil.copy(full, outp)
+            else:
+                shutil.copy(full, outp)
+    return n
+
+
+def read_pack_format(data_root):
+    """Le schema pack.mcmeta a change avec le temps : anciens packs = `pack_format`
+    (entier unique), packs recents = `min_format`/`max_format` (parfois sans
+    `pack_format` du tout). On prend le premier qu'on trouve."""
+    meta = os.path.join(data_root, "pack.mcmeta")
+    if not os.path.isfile(meta):
+        return None
+    try:
+        pack = json.load(open(meta, encoding="utf-8"))["pack"]
+    except Exception:
+        return None
+    for key in ("pack_format", "min_format", "max_format"):
+        v = pack.get(key)
+        if isinstance(v, int):
+            return v
+        if isinstance(v, list) and v and isinstance(v[0], int):
+            return v[0]
+    return None
+
+
+def chown_like_parent(path, parent):
+    try:
+        st = os.stat(parent)
+    except OSError:
+        return
+    for root, dirs, files in os.walk(path):
+        for name in dirs + files:
+            try:
+                os.chown(os.path.join(root, name), st.st_uid, st.st_gid)
+            except PermissionError:
+                pass
+    try:
+        os.chown(path, st.st_uid, st.st_gid)
+    except PermissionError:
+        pass
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Fork un datapack de worldgen vers un namespace prive, scope a un seul nouveau monde.")
+    p.add_argument("src", help="dossier extrait, .zip ou .jar du datapack source")
+    p.add_argument("--ns", required=True, help="namespace cible pour le worldgen forke (ex: ply)")
+    p.add_argument("--world", required=True, help="nom du nouveau monde/dimension (ex: planety)")
+    p.add_argument("--out", required=True, help="dossier de sortie du datapack genere (sera cree)")
+    p.add_argument("--dimension-type", default="minecraft:overworld",
+                    help="type de dimension vanilla a utiliser (defaut: minecraft:overworld)")
+    p.add_argument("--source-dimension",
+                    help="chemin (relatif a data/) du fichier dimension du datapack source a cloner, "
+                         "si different du defaut data/minecraft/dimension/<basename du dimension-type>.json")
+    p.add_argument("--pack-format", type=int, help="pack_format a ecrire (sinon lu depuis le pack.mcmeta source)")
+    p.add_argument("--description", help="description a ecrire dans le pack.mcmeta genere")
+    p.add_argument("--drop-registry", action="append", default=[],
+                    help="registre worldgen additionnel a exclure du fork (repetable)")
+    p.add_argument("--install", metavar="WORLD_DATAPACKS_DIR",
+                    help="apres generation, copie le pack dans ce dossier world/datapacks/ "
+                         "(nom du sous-dossier = basename de --out) et aligne le proprietaire "
+                         "sur celui de ce dossier")
+    p.add_argument("--force", action="store_true", help="ecrase --out s'il existe deja")
+    args = p.parse_args()
+
+    drop_reg = DEFAULT_DROP_REG | set(args.drop_registry)
+
+    if args.ns == "minecraft":
+        die("--ns ne peut pas etre 'minecraft' (ca reviendrait a ecraser le worldgen vanilla / la survie)")
+
+    if os.path.exists(args.out):
+        if not args.force:
+            die(f"{args.out} existe deja (utiliser --force pour l'ecraser)")
+        shutil.rmtree(args.out)
+
+    data_root, tmp_extract = extract_source(args.src)
+    try:
+        data_dir = os.path.join(data_root, "data")
+        src_wg = os.path.join(data_dir, "minecraft", "worldgen")
+        if not os.path.isdir(src_wg):
+            die(f"pas de data/minecraft/worldgen dans la source -- ce n'est pas un datapack "
+                f"de generation de monde (ou il ne remplace pas le worldgen vanilla)")
+
+        forked = build_forked_map(src_wg, drop_reg)
+        all_forked = set().union(*forked.values()) if forked else set()
+        if not all_forked:
+            die("aucun contenu worldgen trouve apres exclusion des registres droppes -- rien a forker")
+
+        walk = make_walk(args.ns, forked, all_forked)
+        errors = []
+
+        n_ns = emit(src_wg, os.path.join(args.out, "data", args.ns, "worldgen"), True, walk, drop_reg, errors)
+
+        n_other = 0
+        for ns in os.listdir(data_dir):
+            if ns == "minecraft":
+                continue
+            n_other += emit(os.path.join(data_dir, ns), os.path.join(args.out, "data", ns), False, walk, drop_reg, errors)
+
+        dim_basename = dimension_basename(args.dimension_type)
+        src_dim_path = (os.path.join(data_dir, args.source_dimension) if args.source_dimension
+                        else os.path.join(data_dir, "minecraft", "dimension", dim_basename))
+        if not os.path.isfile(src_dim_path):
+            die(f"pas de fichier dimension source a cloner ({src_dim_path} introuvable). "
+                f"Ce datapack ne redefinit peut-etre pas la dimension entiere (juste des ajouts) -- "
+                f"ce script ne sait scoper que des packs qui remplacent tout le biome_source. "
+                f"Voir docs/worldgen-fork.md, section 'Datapacks non compatibles'.")
+
+        dim = walk(json.load(open(src_dim_path, encoding="utf-8")), "dimension")
+        dim.pop("fabric:load_conditions", None)
+        dim.pop("neoforge:conditions", None)
+        dim["type"] = args.dimension_type
+        bs = dim.get("generator", {}).get("biome_source", {})
+        had_preset = "preset" in bs
+        bs.pop("preset", None)
+
+        os.makedirs(os.path.join(args.out, "data", "minecraft", "dimension"), exist_ok=True)
+        json.dump(dim, open(os.path.join(args.out, "data", "minecraft", "dimension", f"{args.world}.json"), "w",
+                             encoding="utf-8"), separators=(",", ":"))
+
+        pack_format = args.pack_format or read_pack_format(data_root)
+        if pack_format is None:
+            die("impossible de determiner le pack_format (pas de pack.mcmeta source lisible) -- "
+                "fournir --pack-format explicitement")
+        description = args.description or f"{args.ns} scoped fork -> world {args.world}"
+        json.dump({"pack": {"pack_format": pack_format, "min_format": pack_format,
+                             "max_format": pack_format, "description": description}},
+                   open(os.path.join(args.out, "pack.mcmeta"), "w"), indent=1)
+
+        print(f"{args.ns} worldgen: {n_ns} fichiers | autres namespaces: {n_other} fichiers | erreurs JSON: {len(errors)}")
+        for e in errors[:8]:
+            print("  ERR", e)
+        print(f"dimension minecraft:{args.world} generee (type={args.dimension_type}, "
+              f"biome_source avait un preset: {had_preset} -> retire, {len(bs.get('biomes', []))} biomes inline)")
+        print(f"pack ecrit dans {args.out}")
+
+        if args.install:
+            dest = os.path.join(args.install, os.path.basename(os.path.normpath(args.out)))
+            if os.path.exists(dest):
+                shutil.rmtree(dest)
+            shutil.copytree(args.out, dest)
+            chown_like_parent(dest, args.install)
+            print(f"installe dans {dest} (proprietaire aligne sur {args.install})")
+    finally:
+        if tmp_extract:
+            shutil.rmtree(tmp_extract, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()
